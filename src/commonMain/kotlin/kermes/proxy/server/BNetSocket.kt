@@ -2,14 +2,19 @@
 
 package kermes.proxy.server
 
+import bgs.protocol.account.v1.*
 import bgs.protocol.authentication.v1.LogonRequest
+import bgs.protocol.authentication.v1.LogonResult
 import bgs.protocol.authentication.v1.VerifyWebCredentialsRequest
-import bnet.protocol.Header
-import bnet.protocol.NoData
-import bnet.protocol.ProcessId
+import bgs.protocol.challenge.v1.ChallengeExternalRequest
+import bnet.protocol.*
 import bnet.protocol.connection.v1.ConnectRequest
 import bnet.protocol.connection.v1.ConnectResponse
 import bnet.protocol.connection.v1.DisconnectRequest
+import bnet.protocol.game_utilities.v1.ClientRequest
+import bnet.protocol.game_utilities.v1.ClientResponse
+import bnet.protocol.game_utilities.v1.GetAllValuesForAttributeRequest
+import bnet.protocol.game_utilities.v1.GetAllValuesForAttributeResponse
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.network.selector.*
 import io.ktor.network.sockets.*
@@ -20,6 +25,7 @@ import kotlinx.io.Buffer
 import kotlinx.io.readByteArray
 import kotlinx.rpc.annotations.Rpc
 import kotlinx.serialization.ExperimentalSerializationApi
+import okio.ByteString.Companion.toByteString
 import platform.posix.getpid
 import kotlin.time.Clock
 
@@ -32,16 +38,34 @@ interface BattleNetRpc {
     suspend fun disconnect(request: DisconnectRequest)
     suspend fun logon(request: LogonRequest)
     suspend fun verifyWebCredentials(request: VerifyWebCredentialsRequest)
+    suspend fun getAccountState(request: GetAccountStateRequest): GetAccountStateResponse
+    suspend fun getGameAccountState(request: GetGameAccountStateRequest): GetGameAccountStateResponse
+    suspend fun processClientRequest(request: ClientRequest): ClientResponse
+    suspend fun getAllValuesForAttribute(request: GetAllValuesForAttributeRequest): GetAllValuesForAttributeResponse
+}
+
+interface BnetSender {
+    suspend fun send(
+        serviceHash: UInt,
+        methodId: UInt,
+        payload: ByteArray,
+        token: Int? = null,
+        status: Int = 0
+    )
 }
 
 class BnetSessionState {
     var clientId: ProcessId? = null
     var isAuthenticated: Boolean = false
-    var accountId: String? = null
+    var accountId: Long? = null
+    var gameAccounts: List<Long> = emptyList()
+    var sessionKey: ByteArray? = null
+    var serverTokenCounter: Int = 0
 }
 
 class BattleNetRpcImpl(
-    private val state: BnetSessionState
+    private val state: BnetSessionState,
+    private val sender: BnetSender,
 ) : BattleNetRpc {
     override suspend fun connect(
         request: ConnectRequest
@@ -73,7 +97,19 @@ class BattleNetRpcImpl(
         request: LogonRequest
     ) {
         logger.info { "Logon request for ${request.program} from client ${state.clientId}" }
-        // Advance state here
+
+        val endpoint = "127.0.0.1:11118"
+        val externalChallenge = ChallengeExternalRequest(
+            payload_type = "web_auth_url",
+            payload = "https://$endpoint/bnetserver/login/${request.platform}/${request.application_version}/${request.locale}/".encodeToByteArray()
+                .toByteString()
+        )
+
+        sender.send(
+            serviceHash = OriginalHash.ChallengeListener.value,
+            methodId = 3u,
+            payload = ChallengeExternalRequest.ADAPTER.encode(externalChallenge)
+        )
     }
 
     override suspend fun verifyWebCredentials(
@@ -81,10 +117,97 @@ class BattleNetRpcImpl(
     ) {
         logger.info { "VerifyWebCredentials for client ${state.clientId}" }
         state.isAuthenticated = true
+        state.accountId = 1L
+        state.sessionKey = ByteArray(64) { 0 }
+
+        val logonResult = LogonResult(
+            error_code = 0,
+            account_id = EntityId(
+                low = 1L,
+                high = 72057594037927936L
+            ),
+            game_account_id = listOf(
+                EntityId(
+                    low = 1L,
+                    high = 144115196671520593L
+                )
+            ),
+            session_key = state.sessionKey!!.toByteString()
+        )
+
+        sender.send(
+            serviceHash = OriginalHash.AuthenticationListener.value,
+            methodId = 5u,
+            payload = LogonResult.ADAPTER.encode(logonResult)
+        )
     }
+
+    override suspend fun getAccountState(
+        request: GetAccountStateRequest
+    ): GetAccountStateResponse = GetAccountStateResponse(
+        state = AccountState(
+            privacy_info = PrivacyInfo(
+                is_using_rid = false,
+                is_visible_for_view_friends = false,
+                is_hidden_from_friend_finder = true
+            )
+        ),
+        tags = AccountFieldTags(
+            privacy_info_tag = 3620373325L.toInt()
+        )
+    )
+
+    override suspend fun getGameAccountState(
+        request: GetGameAccountStateRequest
+    ): GetGameAccountStateResponse = GetGameAccountStateResponse(
+        state = GameAccountState(
+            game_level_info = GameLevelInfo(
+                name = "Kermes",
+                program = 5730135L.toInt()
+            ),
+            game_status = GameStatus(
+                program = 5730135L.toInt()
+            )
+        ),
+        tags = GameAccountFieldTags(
+            game_level_info_tag = 1548145795L.toInt(),
+            game_status_tag = 2562154393L.toInt()
+        )
+    )
+
+    override suspend fun processClientRequest(
+        request: ClientRequest
+    ): ClientResponse {
+        val command = request.attribute.find { it.name.startsWith("Command_") }
+        logger.debug { "GameUtilitiesService command: ${command?.name}" }
+
+        if (command?.name?.startsWith("Command_RealmListRequest") == true) {
+            return ClientResponse(
+                attribute = listOf(
+                    Attribute(
+                        name = "Param_RealmList",
+                        value_ = Variant(blob_value = "MockRealmList".encodeToByteArray().toByteString())
+                    ),
+                    Attribute(
+                        name = "Param_CharacterCountList",
+                        value_ = Variant(blob_value = "MockCharCount".encodeToByteArray().toByteString())
+                    )
+                )
+            )
+        }
+
+        return ClientResponse()
+    }
+
+    override suspend fun getAllValuesForAttribute(
+        request: GetAllValuesForAttributeRequest
+    ): GetAllValuesForAttributeResponse = GetAllValuesForAttributeResponse()
 }
 
-suspend fun startBNetTcpServer(host: String, port: Int) = coroutineScope {
+suspend fun startBNetTcpServer(
+    host: String,
+    port: Int
+) = coroutineScope {
     val selectorManager = SelectorManager(Dispatchers.Default)
     val serverSocket = aSocket(selectorManager).tcp().bind(host, port)
 
@@ -93,14 +216,13 @@ suspend fun startBNetTcpServer(host: String, port: Int) = coroutineScope {
     while (isActive) {
         val socket = serverSocket.accept()
         launch {
-            handleBNetConnection(socket, selectorManager)
+            handleBNetConnection(socket)
         }
     }
 }
 
 private suspend fun handleBNetConnection(
-    socket: Socket,
-    selectorManager: SelectorManager
+    socket: Socket
 ) {
     val remoteAddress = socket.remoteAddress
     logger.debug { "New BNet connection from $remoteAddress" }
@@ -109,8 +231,28 @@ private suspend fun handleBNetConnection(
     val sendChannel = socket.openWriteChannel(autoFlush = true)
 
     val state = BnetSessionState()
+    val sender = object : BnetSender {
+        override suspend fun send(
+            serviceHash: UInt,
+            methodId: UInt,
+            payload: ByteArray,
+            token: Int?,
+            status: Int
+        ) {
+            val actualToken = token ?: state.serverTokenCounter++
+            val frame = encodeBnetFrame(
+                serviceId = 0,
+                serviceHash = serviceHash.toInt(),
+                methodId = methodId.toInt(),
+                token = actualToken,
+                status = status,
+                payload = payload
+            )
+            sendChannel.writeFully(frame)
+        }
+    }
     val session = BnetSession(
-        rpc = BattleNetRpcImpl(state)
+        rpc = BattleNetRpcImpl(state, sender)
     )
 
     try {
@@ -192,9 +334,10 @@ class BnetSession(
         header: Header,
         payload: ByteArray,
     ): ByteArray? = when (header.service_hash?.toUInt() to header.method_id?.toUInt()) {
+        // ConnectionService
         OriginalHash.ConnectionService.value to 1u -> {
             val response = rpc.connect(ConnectRequest.ADAPTER.decode(payload))
-            encode(
+            encodeBnetFrame(
                 serviceId = header.service_id,
                 serviceHash = header.service_hash ?: 0,
                 methodId = header.method_id ?: 0,
@@ -205,57 +348,110 @@ class BnetSession(
 
         OriginalHash.ConnectionService.value to 5u -> {
             rpc.keepAlive(NoData())
-            null
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token
+            )
         }
 
         OriginalHash.ConnectionService.value to 7u -> {
             rpc.disconnect(DisconnectRequest.ADAPTER.decode(payload))
-            null
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token
+            )
         }
 
+        // AuthenticationService
         OriginalHash.AuthenticationService.value to 1u -> {
             rpc.logon(LogonRequest.ADAPTER.decode(payload))
-            null
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token
+            )
         }
 
         OriginalHash.AuthenticationService.value to 7u -> {
             rpc.verifyWebCredentials(
                 VerifyWebCredentialsRequest.ADAPTER.decode(payload)
             )
-            null
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token
+            )
+        }
+
+        // AccountService
+        OriginalHash.AccountService.value to 30u -> {
+            val response = rpc.getAccountState(
+                GetAccountStateRequest.ADAPTER.decode(payload)
+            )
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token,
+                payload = GetAccountStateResponse.ADAPTER.encode(response)
+            )
+        }
+
+        OriginalHash.AccountService.value to 31u -> {
+            val response = rpc.getGameAccountState(
+                GetGameAccountStateRequest.ADAPTER.decode(payload)
+            )
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token,
+                payload = GetGameAccountStateResponse.ADAPTER.encode(response)
+            )
+        }
+
+        // GameUtilitiesService
+        OriginalHash.GameUtilitiesService.value to 1u -> {
+            val response = rpc.processClientRequest(
+                ClientRequest.ADAPTER.decode(payload)
+            )
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token,
+                payload = ClientResponse.ADAPTER.encode(response)
+            )
+        }
+
+        OriginalHash.GameUtilitiesService.value to 10u -> {
+            val response = rpc.getAllValuesForAttribute(
+                GetAllValuesForAttributeRequest.ADAPTER.decode(payload)
+            )
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token,
+                payload = GetAllValuesForAttributeResponse.ADAPTER.encode(response)
+            )
         }
 
         else -> {
             logger.warn { "Unknown BNet RPC: service_hash=${header.service_hash}, method_id=${header.method_id}" }
-            null
+            encodeBnetFrame(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token
+            )
         }
-    }
-
-    fun encode(
-        serviceId: Int,
-        serviceHash: Int,
-        methodId: Int,
-        token: Int,
-        status: Int = 0,
-        payload: ByteArray = byteArrayOf(),
-    ): ByteArray {
-        val header = Header(
-            token = token,
-            status = status,
-            service_id = serviceId,
-            service_hash = serviceHash,
-            method_id = methodId,
-            size = payload.size,
-        )
-
-        val headerBytes = Header.ADAPTER.encode(header)
-
-        return buildList {
-            add((headerBytes.size shr 8).toByte())
-            add(headerBytes.size.toByte())
-            addAll(headerBytes.asList())
-            addAll(payload.asList())
-        }.toByteArray()
     }
 
     private fun rewind(
@@ -277,4 +473,31 @@ class BnetSession(
                 (bytes[1].toInt() and 0xff))
             .toUShort()
     }
+}
+
+fun encodeBnetFrame(
+    serviceId: Int,
+    serviceHash: Int,
+    methodId: Int,
+    token: Int,
+    status: Int = 0,
+    payload: ByteArray = byteArrayOf(),
+): ByteArray {
+    val header = Header(
+        token = token,
+        status = status,
+        service_id = serviceId,
+        service_hash = serviceHash,
+        method_id = methodId,
+        size = payload.size,
+    )
+
+    val headerBytes = Header.ADAPTER.encode(header)
+
+    return buildList {
+        add((headerBytes.size shr 8).toByte())
+        add(headerBytes.size.toByte())
+        addAll(headerBytes.asList())
+        addAll(payload.asList())
+    }.toByteArray()
 }
