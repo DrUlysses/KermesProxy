@@ -47,7 +47,7 @@ class BattleNetRpcImpl(
         request: ConnectRequest
     ): ConnectResponse = Clock.System.now().let { now ->
         state.clientId = request.client_id
-        
+
         ConnectResponse(
             client_id = request.client_id,
             server_id = ProcessId(
@@ -57,7 +57,7 @@ class BattleNetRpcImpl(
             server_time = now.toEpochMilliseconds(),
             use_bindless_rpc = request.use_bindless_rpc,
         )
-    } 
+    }
 
     override suspend fun keepAlive(request: NoData) {
         logger.debug { "KeepAlive received for client ${state.clientId}" }
@@ -114,15 +114,16 @@ private suspend fun handleBNetConnection(
     )
 
     try {
+        val buffer = ByteArray(4096)
         while (!receiveChannel.isClosedForRead) {
-            val packet = receiveChannel.readRemaining(Long.MAX_VALUE)
-            if (packet.exhausted()) {
+            val read = receiveChannel.readAvailable(buffer)
+            if (read <= 0) {
+                if (read == -1) break
                 yield()
                 continue
             }
-            
-            val data = packet.readByteArray()
-            val responses = session.onData(data)
+
+            val responses = session.onData(buffer.copyOfRange(0, read))
 
             for (response in responses) {
                 sendChannel.writeFully(response)
@@ -190,45 +191,43 @@ class BnetSession(
     private suspend fun dispatch(
         header: Header,
         payload: ByteArray,
-    ): ByteArray? {
-        return when (header.service_hash to header.method_id) {
-            OriginalHash.ConnectionService.value to 1u -> {
-                val response = rpc.connect(ConnectRequest.ADAPTER.decode(payload))
-                encode(
-                    serviceId = header.service_id,
-                    serviceHash = header.service_hash ?: 0,
-                    methodId = header.method_id ?: 0,
-                    token = header.token,
-                    payload = ConnectResponse.ADAPTER.encode(response)
-                )
-            }
+    ): ByteArray? = when (header.service_hash?.toUInt() to header.method_id?.toUInt()) {
+        OriginalHash.ConnectionService.value to 1u -> {
+            val response = rpc.connect(ConnectRequest.ADAPTER.decode(payload))
+            encode(
+                serviceId = header.service_id,
+                serviceHash = header.service_hash ?: 0,
+                methodId = header.method_id ?: 0,
+                token = header.token,
+                payload = ConnectResponse.ADAPTER.encode(response)
+            )
+        }
 
-            OriginalHash.ConnectionService.value to 5u -> {
-                rpc.keepAlive(NoData())
-                null
-            }
+        OriginalHash.ConnectionService.value to 5u -> {
+            rpc.keepAlive(NoData())
+            null
+        }
 
-            OriginalHash.ConnectionService.value to 7u -> {
-                rpc.disconnect(DisconnectRequest.ADAPTER.decode(payload))
-                null
-            }
+        OriginalHash.ConnectionService.value to 7u -> {
+            rpc.disconnect(DisconnectRequest.ADAPTER.decode(payload))
+            null
+        }
 
-            OriginalHash.AuthenticationService.value to 1u -> {
-                rpc.logon(LogonRequest.ADAPTER.decode(payload))
-                null
-            }
+        OriginalHash.AuthenticationService.value to 1u -> {
+            rpc.logon(LogonRequest.ADAPTER.decode(payload))
+            null
+        }
 
-            OriginalHash.AuthenticationService.value to 7u -> {
-                rpc.verifyWebCredentials(
-                    VerifyWebCredentialsRequest.ADAPTER.decode(payload)
-                )
-                null
-            }
+        OriginalHash.AuthenticationService.value to 7u -> {
+            rpc.verifyWebCredentials(
+                VerifyWebCredentialsRequest.ADAPTER.decode(payload)
+            )
+            null
+        }
 
-            else -> {
-                logger.warn { "Unknown BNet RPC: service_hash=${header.service_hash}, method_id=${header.method_id}" }
-                null
-            }
+        else -> {
+            logger.warn { "Unknown BNet RPC: service_hash=${header.service_hash}, method_id=${header.method_id}" }
+            null
         }
     }
 
@@ -259,7 +258,10 @@ class BnetSession(
         }.toByteArray()
     }
 
-    private fun rewind(size: UShort, header: ByteArray) {
+    private fun rewind(
+        size: UShort,
+        header: ByteArray
+    ) {
         val tmp = Buffer()
         tmp.writeByte((size.toInt() shr 8).toByte())
         tmp.writeByte(size.toByte())
