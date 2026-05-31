@@ -5,8 +5,8 @@ import io.ktor.server.cio.*
 import io.ktor.server.engine.*
 import kermes.proxy.config.loadAndVerifyConfig
 import kermes.proxy.server.bNetRest
-import kermes.proxy.server.startBNetTcpServer
 import kermes.proxy.server.realmSocket
+import kermes.proxy.server.rpc.startBNetTcpServer
 import kermes.proxy.server.worldSocket
 import kermes.proxy.utils.*
 import kotlinx.coroutines.Dispatchers
