@@ -1,0 +1,22 @@
+[package]
+name = "kermes-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+uniffi = "0.31.1"
+
+tokio = { version = "1", features = ["rt", "net"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+
+p12-keystore = "0.2.1"
+
+[lib]
+crate-type = ["staticlib"]
+
+path = "src/commonMain/rust/lib.rs"
